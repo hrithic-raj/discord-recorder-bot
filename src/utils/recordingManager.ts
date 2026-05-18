@@ -5,7 +5,7 @@ import {
 import {
   joinVoiceChannel, VoiceConnection,
   VoiceConnectionStatus, EndBehaviorType,
-  getVoiceConnection,
+  entersState, getVoiceConnection,
 } from '@discordjs/voice';
 import path from 'path';
 import fs   from 'fs';
@@ -33,23 +33,33 @@ interface Session {
   userBuffers:   Map<string, Buffer>;
   userNames:     Map<string, string>;
   watchdog:      NodeJS.Timeout;
-  /** True once the connection has fully reached Ready state */
-  ready:         boolean;
 }
 
 export class RecordingManager {
-  private sessions  = new Map<string, Session>();
-  /** Channels currently in the middle of connecting – blocks duplicate attempts */
+  private sessions   = new Map<string, Session>();
   private connecting = new Set<string>();
+  /** channelId → timestamp of last failed connect — prevents instant retry loops */
+  private cooldowns  = new Map<string, number>();
+  private readonly COOLDOWN_MS = 30_000; // 30 s between retries after failure
 
   private uploader = new DriveUploader(
     config.google.credentialsFile,
     config.google.driveFolderId,
   );
 
-  isRecording(channelId: string): boolean           { return this.sessions.has(channelId); }
-  isConnecting(channelId: string): boolean          { return this.connecting.has(channelId); }
-  getSessions(): ReadonlyMap<string, Session>       { return this.sessions; }
+  isRecording(channelId: string): boolean         { return this.sessions.has(channelId); }
+  isConnecting(channelId: string): boolean        { return this.connecting.has(channelId); }
+  getSessions(): ReadonlyMap<string, Session>     { return this.sessions; }
+
+  isCoolingDown(channelId: string): boolean {
+    const t = this.cooldowns.get(channelId);
+    if (!t) return false;
+    if (Date.now() - t > this.COOLDOWN_MS) {
+      this.cooldowns.delete(channelId);
+      return false;
+    }
+    return true;
+  }
 
   // ── Start ──────────────────────────────────────────────────────────────
 
@@ -58,26 +68,25 @@ export class RecordingManager {
     initiatedBy:   GuildMember | null;
     notifyChannel: TextChannel | null;
   }): Promise<{ ok: boolean; message: string }> {
-    const { channel, initiatedBy, notifyChannel } = opts;
+    const { channel } = opts;
     const cid = channel.id;
 
-    // Gate: already recording OR already in the middle of connecting
     if (this.sessions.has(cid))
       return { ok: false, message: `⚠️ Already recording **${channel.name}**.` };
     if (this.connecting.has(cid))
       return { ok: false, message: `⏳ Already connecting to **${channel.name}**…` };
+    if (this.isCoolingDown(cid))
+      return { ok: false, message: `⏳ Connection failed recently. Retrying in ${this.COOLDOWN_MS / 1000}s…` };
 
     this.connecting.add(cid);
-
     try {
-      return await this._doConnect(opts);
+      return await this._connect(opts);
     } finally {
-      // Always remove the lock, whether we succeeded or failed
       this.connecting.delete(cid);
     }
   }
 
-  private async _doConnect(opts: {
+  private async _connect(opts: {
     channel:       VoiceChannel;
     initiatedBy:   GuildMember | null;
     notifyChannel: TextChannel | null;
@@ -85,22 +94,19 @@ export class RecordingManager {
     const { channel, initiatedBy, notifyChannel } = opts;
     const cid = channel.id;
 
-    // Safe filename: strip all non-ASCII and special chars
     const ts       = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const safeName = channel.name
       .replace(/[^\x20-\x7E]/g, '')
       .replace(/[^a-zA-Z0-9 _-]/g, '')
-      .trim()
-      .replace(/\s+/g, '_') || 'channel';
+      .trim().replace(/\s+/g, '_') || 'channel';
     const outputPath = path.resolve(config.recording.dir, `${safeName}_${ts}.wav`);
 
-    // If there's a stale connection for this guild that isn't one of our
-    // active sessions, destroy it quietly before joining
-    const existing = getVoiceConnection(channel.guild.id);
-    if (existing && !this.sessions.has(cid)) {
-      log.info('Cleaning up stale voice connection.');
-      existing.destroy();
-      await sleep(600);
+    // Destroy any pre-existing connection for this guild
+    const stale = getVoiceConnection(channel.guild.id);
+    if (stale) {
+      log.info('Destroying stale connection.');
+      stale.destroy();
+      await sleep(800);
     }
 
     let connection: VoiceConnection;
@@ -114,31 +120,47 @@ export class RecordingManager {
         selfMute:  true,
       });
 
-      // Wait for the connection to be fully ready
-      await waitForReady(connection, 20_000);
+      // Handle the Connecting state first — the library requires this
+      // when the connection starts in Signalling state
+      if (connection.state.status !== VoiceConnectionStatus.Ready) {
+        try {
+          // Move through Signalling→Connecting first
+          await entersState(connection, VoiceConnectionStatus.Connecting, 10_000);
+        } catch {
+          // Already past Connecting, that's fine
+        }
+        // Now wait for Ready (voice UDP handshake complete)
+        await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+      }
+
+      log.info(`Voice connection ready for #${channel.name}`);
     } catch (err) {
       log.error(`Failed to join "${channel.name}"`, err);
+      this.cooldowns.set(cid, Date.now());
+      try { connection!.destroy(); } catch { /* ignore */ }
       try { getVoiceConnection(channel.guild.id)?.destroy(); } catch { /* ignore */ }
       return {
         ok: false,
         message: `❌ Could not connect to **${channel.name}**.\n` +
-                 `Check I have **Connect** and **View Channel** permissions there.`,
+                 `This is usually a network/UDP issue, not a permissions issue.\n` +
+                 `Check that port **UDP 50000–65535** is not blocked by your firewall.\n` +
+                 `Will retry automatically in ${this.COOLDOWN_MS / 1000}s.`,
       };
     }
 
-    // ── Connection is Ready — set up audio capture ──
+    // ── Connected — set up audio capture ──────────────────────────────────
 
     const userBuffers = new Map<string, Buffer>();
     const userNames   = new Map<string, string>();
     const receiver    = connection.receiver;
 
-    const onSpeakingStart = (userId: string) => {
+    receiver.speaking.on('start', (userId: string) => {
       if (receiver.subscriptions.has(userId)) return;
       const member = channel.members.get(userId);
       if (member?.user.bot) return;
 
       userNames.set(userId, member?.displayName ?? userId);
-      log.info(`Subscribed to audio: ${userNames.get(userId)}`);
+      log.info(`Capturing audio from: ${userNames.get(userId)}`);
 
       const decoder = new OpusScript(48_000, 2, OpusScript.Application.AUDIO);
       const chunks: Buffer[] = [];
@@ -156,12 +178,11 @@ export class RecordingManager {
         if (!chunks.length) return;
         const prev = userBuffers.get(userId) ?? Buffer.alloc(0);
         userBuffers.set(userId, Buffer.concat([prev, ...chunks]));
-        log.info(`Saved audio chunk for ${userNames.get(userId)} (${chunks.length} packets)`);
+        log.info(`Flushed audio for ${userNames.get(userId)} (${chunks.length} packets)`);
       });
-    };
+    });
 
-    receiver.speaking.on('start', onSpeakingStart);
-
+    // Watchdog: auto-stop after configured max hours
     const watchdog = setTimeout(() => {
       log.warn(`Watchdog: stopping ${channel.name} after ${config.recording.maxHours}h`);
       this.stopRecording(cid, 'max duration exceeded');
@@ -170,22 +191,15 @@ export class RecordingManager {
     const session: Session = {
       connection, channel, startedAt: new Date(),
       initiatedBy, notifyChannel,
-      outputPath, userBuffers, userNames,
-      watchdog, ready: true,
+      outputPath, userBuffers, userNames, watchdog,
     };
     this.sessions.set(cid, session);
 
-    // Only NOW attach the disconnect handler — AFTER the session is registered
-    // and AFTER the connection is confirmed ready.  Attaching it earlier caused
-    // the handler to fire during normal connection setup (Signalling→Connecting
-    // briefly shows Disconnected on some network paths) and immediately tear
-    // down the session we just created.
-    connection.on('stateChange' as any, (_: any, newState: any) => {
-      if (newState.status === VoiceConnectionStatus.Disconnected) {
-        if (!this.sessions.has(cid)) return; // already stopped
-        log.warn(`Unexpected disconnect from #${channel.name} — stopping.`);
-        this.stopRecording(cid, 'unexpected disconnect');
-      }
+    // Attach disconnect handler only AFTER session is registered
+    connection.on(VoiceConnectionStatus.Disconnected as any, () => {
+      if (!this.sessions.has(cid)) return;
+      log.warn(`Unexpected disconnect from #${channel.name}`);
+      this.stopRecording(cid, 'unexpected disconnect');
     });
 
     log.info(`Recording started: #${channel.name} → ${outputPath}`);
@@ -200,12 +214,11 @@ export class RecordingManager {
     const s = this.sessions.get(channelId);
     if (!s) return;
 
-    this.sessions.delete(channelId); // remove first to prevent re-entrant calls
+    this.sessions.delete(channelId);
     clearTimeout(s.watchdog);
     log.info(`Stopping: #${s.channel.name} (${reason})`);
 
-    // Wait for in-flight audio stream 'end' events to flush
-    await sleep(1000);
+    await sleep(1000); // flush audio stream end events
 
     try {
       s.connection.receiver.speaking.removeAllListeners();
@@ -213,11 +226,10 @@ export class RecordingManager {
     } catch { /* already gone */ }
 
     const hasAudio = s.userBuffers.size > 0;
-    log.info(`Captured audio from ${s.userBuffers.size} user(s): ${[...s.userNames.values()].join(', ') || 'none'}`);
+    log.info(`Audio from ${s.userBuffers.size} user(s): ${[...s.userNames.values()].join(', ') || 'none'}`);
 
     if (!hasAudio) {
-      const msg = `⏹️ Recording stopped for **${s.channel.name}** — no audio was captured.`;
-      log.warn(msg);
+      const msg = `⏹️ Recording stopped for **${s.channel.name}** — no audio captured (no one spoke).`;
       if (s.notifyChannel) await safeSend(s.notifyChannel, msg);
       return;
     }
@@ -225,19 +237,16 @@ export class RecordingManager {
     mixAndSave(s.userBuffers, s.outputPath);
 
     if (!fs.existsSync(s.outputPath)) {
-      log.error(`WAV write failed: ${s.outputPath}`);
       if (s.notifyChannel)
         await safeSend(s.notifyChannel, `❌ Failed to write recording for **${s.channel.name}**.`);
       return;
     }
 
     if (s.notifyChannel)
-      await safeSend(s.notifyChannel, `⏹️ Recording stopped for **${s.channel.name}**. Uploading to Google Drive…`);
+      await safeSend(s.notifyChannel, `⏹️ Stopped **${s.channel.name}**. Uploading to Google Drive…`);
 
     this.uploadAndNotify(s).catch(err => log.error('uploadAndNotify failed', err));
   }
-
-  // ── Upload ─────────────────────────────────────────────────────────────
 
   private async uploadAndNotify(s: Session): Promise<void> {
     const link = await this.uploader.upload({
@@ -261,58 +270,18 @@ export class RecordingManager {
         );
       await safeSend(s.notifyChannel, undefined, embed);
     } else if (!link && s.notifyChannel) {
-      await safeSend(s.notifyChannel,
-        `❌ Drive upload failed. File saved locally: \`${s.outputPath}\``);
+      await safeSend(s.notifyChannel, `❌ Drive upload failed. Saved locally: \`${s.outputPath}\``);
     }
 
     if (link) { try { fs.unlinkSync(s.outputPath); } catch { /* ignore */ } }
   }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-/**
- * Wait for a voice connection to reach Ready.
- * Correctly handles the Signalling → Connecting → Ready progression
- * without being tripped by transient Disconnected states during setup.
- */
-function waitForReady(conn: VoiceConnection, timeoutMs: number): Promise<void> {
-  if (conn.state.status === VoiceConnectionStatus.Ready) return Promise.resolve();
-
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for voice connection after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    function onStateChange(_: any, newState: any) {
-      if (newState.status === VoiceConnectionStatus.Ready) {
-        cleanup();
-        resolve();
-      } else if (newState.status === VoiceConnectionStatus.Destroyed) {
-        cleanup();
-        reject(new Error('Voice connection destroyed before becoming ready'));
-      }
-      // Deliberately ignore Disconnected/Connecting/Signalling during setup
-    }
-
-    function cleanup() {
-      clearTimeout(timer);
-      conn.removeListener('stateChange' as any, onStateChange);
-    }
-
-    conn.on('stateChange' as any, onStateChange);
-  });
-}
+function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
 
 async function safeSend(ch: TextChannel, content?: string, embed?: EmbedBuilder) {
-  try {
-    embed ? await ch.send({ embeds: [embed] }) : await ch.send(content!);
-  } catch { /* channel unavailable */ }
+  try { embed ? await ch.send({ embeds: [embed] }) : await ch.send(content!); }
+  catch { /* channel unavailable */ }
 }
 
 function fmtDuration(from: Date): string {

@@ -5,69 +5,53 @@ import { createLogger }     from '../utils/logger';
 
 const log = createLogger('VoiceState');
 
-// Debounce map: channelId → timer
-// When multiple voice state events fire in rapid succession (e.g. all 3 users
-// joining at once each fires its own event), we wait 1.5 s and only act once.
+// Debounce: collapse rapid-fire events for the same channel into one action
 const debounceTimers = new Map<string, NodeJS.Timeout>();
-const DEBOUNCE_MS = 1500;
+const DEBOUNCE_MS = 2000;
 
 export function onVoiceStateUpdate(
   oldState: VoiceState,
   newState: VoiceState,
   manager:  RecordingManager,
 ): void {
-  // Collect every auto-record channel touched by this event
   const toCheck = new Set<VoiceChannel>();
-  if (oldState.channel?.type === ChannelType.GuildVoice &&
-      autoChannels.has(oldState.channel.id))
+  if (oldState.channel?.type === ChannelType.GuildVoice && autoChannels.has(oldState.channel.id))
     toCheck.add(oldState.channel as VoiceChannel);
-  if (newState.channel?.type === ChannelType.GuildVoice &&
-      autoChannels.has(newState.channel.id))
+  if (newState.channel?.type === ChannelType.GuildVoice && autoChannels.has(newState.channel.id))
     toCheck.add(newState.channel as VoiceChannel);
 
   for (const ch of toCheck) {
-    // Cancel any pending debounce for this channel and restart it
     const existing = debounceTimers.get(ch.id);
     if (existing) clearTimeout(existing);
-
-    const timer = setTimeout(() => {
+    debounceTimers.set(ch.id, setTimeout(() => {
       debounceTimers.delete(ch.id);
-      handleChannel(ch, manager);
-    }, DEBOUNCE_MS);
-
-    debounceTimers.set(ch.id, timer);
+      handleChannel(ch, manager).catch(err => log.error('handleChannel error', err));
+    }, DEBOUNCE_MS));
   }
 }
 
 async function handleChannel(ch: VoiceChannel, manager: RecordingManager): Promise<void> {
-  // Re-fetch the channel so the member list is current
-  try { await ch.fetch(); } catch { /* ignore, use cached */ }
-
-  const humans    = ch.members.filter(m => !m.user.bot).size;
-  const recording = manager.isRecording(ch.id);
+  const humans     = ch.members.filter(m => !m.user.bot).size;
+  const recording  = manager.isRecording(ch.id);
   const connecting = manager.isConnecting(ch.id);
+  const cooldown   = manager.isCoolingDown(ch.id);
 
-  log.info(`#${ch.name}: ${humans} human(s) | recording=${recording} | connecting=${connecting}`);
+  log.info(`#${ch.name}: ${humans} humans | recording=${recording} connecting=${connecting} cooldown=${cooldown}`);
 
-  if (humans >= 2 && !recording && !connecting) {
+  if (humans >= 2 && !recording && !connecting && !cooldown) {
     log.info(`Auto-starting recording in #${ch.name}`);
 
-    const guild  = ch.guild;
-    const me     = guild.members.me;
-    const textCh = (
-      guild.channels.cache.find(
-        c => c.type === ChannelType.GuildText &&
-             (!me || c.permissionsFor(me)?.has('SendMessages')),
-      ) ?? null
-    ) as TextChannel | null;
+    const me     = ch.guild.members.me;
+    const textCh = (ch.guild.channels.cache.find(
+      c => c.type === ChannelType.GuildText &&
+           (!me || c.permissionsFor(me)?.has('SendMessages')),
+    ) ?? null) as TextChannel | null;
 
-    const result = await manager.startRecording({
-      channel: ch, initiatedBy: null, notifyChannel: textCh,
-    });
-    log.info(`Start result: ${result.message}`);
+    const result = await manager.startRecording({ channel: ch, initiatedBy: null, notifyChannel: textCh });
+    if (!result.ok) log.warn(`Auto-start failed: ${result.message}`);
 
   } else if (humans < 2 && recording) {
-    log.info(`Auto-stopping #${ch.name} — only ${humans} human(s) left`);
+    log.info(`Auto-stopping #${ch.name} — ${humans} human(s) left`);
     await manager.stopRecording(ch.id, 'all users left');
   }
 }
