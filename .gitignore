@@ -1,0 +1,8 @@
+node_modules/
+dist/
+recordings/
+.env
+credentials.json
+bot_data.json
+bot.log
+*.wav
