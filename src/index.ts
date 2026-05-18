@@ -17,8 +17,33 @@ import {
   removeAutoChannelCmd,
   listAutoChannelsCmd,
 } from './commands/autoChannels';
+const express = require("express");
+const app = express();
 
 const log = createLogger('Bot');
+
+
+const PORT = process.env.PORT || 3000;
+
+app.get("/", (req:any, res:any) => {
+  res.json({
+    success: true,
+    message: 'Server is running',
+    timestamp: new Date().toISOString(),
+  });
+});
+app.get('/health', (req:any, res:any) => {
+  res.json({
+    success: true,
+    message: 'Server is running',
+    timestamp: new Date().toISOString(),
+  });
+});
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+
 
 const client = new Client({
   intents: [
